@@ -1,0 +1,24 @@
+﻿# Тайни/ключове — НИКОГА не се качват в Git
+.env
+
+# Локална база данни (съдържа реални разговори на клиента)
+calls.db
+*.db
+
+# Свалени аудио записи
+audio_storage/
+test_audio/
+results/
+
+# Excel отчети (генерират се автоматично, не трябва да живеят в Git)
+call_analysis_report.xlsx
+
+# Python
+__pycache__/
+*.pyc
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
