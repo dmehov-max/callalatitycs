@@ -9,6 +9,12 @@ HTTPS адрес, защото Callflow сам изпраща известия �
 Endpoint, който трябва да регистрираш в Callflow настройките:
   https://<твоя-домейн>/webhook/callflow
 
+ВАЖНО: обработката в отделна нишка (thread) е "fire-and-forget" — ако
+процесът рестартира по средата, тя умира без следа. За да не се губят
+разговори тихо, всеки заседнал/провален разговор се довършва по-късно
+от reconcile.py (виж отделен systemd timer). Този файл само стартира
+първия опит; reconcile.py покрива всички пропуснати случаи.
+
 Стартиране (development):
   python webhook_server.py
 
@@ -33,24 +39,14 @@ app = Flask(__name__)
 
 AUDIO_STORAGE_DIR = Path(__file__).parent / "audio_storage"
 
-# По спецификация: обработваме разговор само ако наистина е бил вдигнат
-# и е имал реална продължителност — иначе няма аудио съдържание за анализ.
 MIN_BILLSEC_TO_PROCESS = 5
 
-# dialstatus стойности, означаващи че разговорът НЕ е бил вдигнат от
-# служителя — важни за проследяване на пропуснати потенциални клиенти
-# (виж insert_missed_call и get_daily_followup_report в db.py).
 MISSED_DIALSTATUSES = {"NOANSWER", "BUSY", "CANCEL", "CONGESTION",
                         "EXTEN_NOANSWER", "EXTEN_BUSY"}
 
 
 @app.route("/webhook/callflow", methods=["POST"])
 def callflow_webhook():
-    """
-    Приема POST заявки от Callflow при всяко събитие на разговор.
-    Отговорът ВИНАГИ трябва да е в описания в спецификацията формат,
-    независимо дали сме обработили събитието или сме го игнорирали.
-    """
     try:
         payload = request.get_json(force=True, silent=True)
         if payload is None:
@@ -64,8 +60,6 @@ def callflow_webhook():
         elif event == "endcall" and dialstatus in MISSED_DIALSTATUSES:
             _handle_missed_call(payload)
 
-        # За всички останали събития (startcall, answer, dial_device) само
-        # потвърждаваме получаването — нямаме нужда да действаме по тях сега.
         return jsonify({"status": "accepted"}), 200
 
     except Exception:
@@ -74,12 +68,6 @@ def callflow_webhook():
 
 
 def _handle_missed_call(payload: dict):
-    """
-    Пропуснат/необvдигнат разговор — записваме САМО метаданни (номер, час,
-    посока), БЕЗ да опитваме сваляне на запис (няма аудио за такъв
-    разговор). Използва се за дневната проверка "липсва последващо
-    обаждане" (виж db.get_daily_followup_report).
-    """
     call_id = payload.get("callId")
     direction = payload.get("direction", "")
 
@@ -118,7 +106,6 @@ def _handle_completed_call(payload: dict):
               f"(вероятно без реален разговор), пропускам.")
         return
 
-    # Клиентският номер е anumber при входящ разговор, bnumber при изходящ.
     customer_number = payload.get("anumber") if direction == "IN" else payload.get("bnumber")
 
     call_datetime_raw = payload.get("endcall", "")
@@ -129,7 +116,7 @@ def _handle_completed_call(payload: dict):
         "call_date": call_date,
         "call_datetime": call_datetime_raw,
         "duration_seconds": billsec,
-        "agent_name": None,          # ще се попълни от AI анализа на транскрипта
+        "agent_name": None,
         "agent_extension": None,
         "customer_number": customer_number,
         "direction": direction,
@@ -137,11 +124,16 @@ def _handle_completed_call(payload: dict):
         "audio_source_url": None,
     }
     db_call_id = db.insert_call(db_call)
+
+    existing = db.get_call_by_id(db_call_id)
+    if existing and existing["status"] == "analyzed":
+        print(f"[webhook] {call_id}: вече анализиран (db id={db_call_id}) — "
+              f"дублиран webhook, пропускам повторна обработка.")
+        return
+
     print(f"[webhook] Регистриран разговор {call_id} (db id={db_call_id}, "
           f"{billsec}s, {direction}). Стартирам обработка на заден фон...")
 
-    # Обработката (сваляне+транскрибация+анализ) отнема секунди-минути —
-    # не бива да блокира отговора към Callflow. Пуска се в отделна нишка.
     thread = threading.Thread(
         target=_process_call_pipeline,
         args=(db_call_id, call_id),
@@ -151,29 +143,12 @@ def _handle_completed_call(payload: dict):
 
 
 def _process_call_pipeline(db_call_id: int, external_call_id: str):
-    """
-    Пълната верига за един разговор: сваляне на записа -> транскрибация ->
-    AI анализ (вкл. извличане на име на служителя) -> запис в базата.
-
-    Изпълнява се в отделна нишка на всяко пристигнало известие — при
-    висок обем разговори едновременно, това означава множество паралелни
-    Whisper/Claude заявки. Ако това стане проблем (rate limits), се
-    добавя опашка с ограничен брой worker-и вместо неограничени нишки.
-    """
     try:
-        # 1. Сваляне на аудиото (Callflow Метод 4)
         dest_dir = str(AUDIO_STORAGE_DIR / datetime.now().strftime("%Y-%m-%d"))
         audio_path = fetch_and_save_recording(external_call_id, dest_dir)
-        with db.get_conn() as conn:
-            conn.execute(
-                "UPDATE calls SET audio_file_path = ? WHERE id = ?",
-                (audio_path, db_call_id),
-            )
+        db.set_audio_path(db_call_id, audio_path)
         print(f"[pipeline] {external_call_id}: аудио свалено -> {audio_path}")
 
-        # 2. Транскрибация (3 модела за по-надеждно съгласуване — виж
-        #    analyze.py за защо: единичен модел може да "халюцинира" на
-        #    труден/шумен пасаж, 3 независими гласа са по-надеждни от 1)
         transcript_result = transcribe_file(audio_path)
         transcript_result_2 = transcribe_file_diarized(audio_path)
         transcript_result_3 = transcribe_file(audio_path, model="gpt-4o-transcribe")
@@ -184,14 +159,8 @@ def _process_call_pipeline(db_call_id: int, external_call_id: str):
         print(f"[pipeline] {external_call_id}: транскрибиран (3 модела, "
               f"{transcript_result['duration_minutes']} мин)")
 
-        # 3. AI анализ (извлича и името на служителя от транскрипта,
-        #    съгласува трите транскрипта в един по-точен)
-        with db.get_conn() as conn:
-            row = conn.execute(
-                "SELECT duration_seconds, direction FROM calls WHERE id = ?",
-                (db_call_id,),
-            ).fetchone()
-        metadata = {"duration_seconds": row["duration_seconds"], "direction": row["direction"]}
+        call_row = db.get_call_by_id(db_call_id)
+        metadata = {"duration_seconds": call_row["duration_seconds"], "direction": call_row["direction"]}
 
         analysis = analyze_transcript(
             transcript_result["text"], metadata,
@@ -215,11 +184,10 @@ def _process_call_pipeline(db_call_id: int, external_call_id: str):
               f"({analysis['agent_name_confidence']}) — категория={analysis['call_category']} "
               f"— {analysis['overall_score']}/10 — {status}")
 
-    except Exception:
+    except Exception as exc:
         print(f"[pipeline] ГРЕШКА при обработка на {external_call_id}:")
         traceback.print_exc()
-        with db.get_conn() as conn:
-            conn.execute("UPDATE calls SET status = 'failed' WHERE id = ?", (db_call_id,))
+        db.mark_call_failed(db_call_id, f"{type(exc).__name__}: {exc}")
 
 
 @app.route("/health", methods=["GET"])
